@@ -10,13 +10,51 @@ on:
   pull_request_review:
     types: [submitted]
 
+permissions: {}
+
 jobs:
+  authorize:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      allowed: ${{ steps.permission.outputs.allowed }}
+    steps:
+      - name: Authorize actor and source before granting credentials
+        id: permission
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        with:
+          script: |
+            core.setOutput('allowed', 'false');
+            const p = context.payload;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const users = new Set([context.actor, process.env.GITHUB_TRIGGERING_ACTOR]);
+            const source = p.comment?.user || p.review?.user || p.issue?.user || p.pull_request?.user;
+            if (source?.login) users.add(source.login);
+            if (!context.actor || !process.env.GITHUB_TRIGGERING_ACTOR) return;
+            for (const username of users) {
+              const { data } = await github.rest.repos.getCollaboratorPermissionLevel({owner, repo, username});
+              if (!['admin', 'maintain', 'write'].includes(data.permission)) {
+                core.notice('Rejected an actor without repository write permission');
+                return;
+              }
+            }
+            const number = p.pull_request?.number || (p.issue?.pull_request ? p.issue.number : null) || p.inputs?.pr_number;
+            if (number) {
+              if (!/^[1-9][0-9]*$/.test(String(number))) throw new Error('Invalid PR number');
+              const { data: pr } = await github.rest.pulls.get({owner, repo, pull_number: Number(number)});
+              if (pr.state !== 'open' || pr.base.repo.full_name !== `${owner}/${repo}` || pr.head.repo?.full_name !== `${owner}/${repo}`) {
+                core.notice('Privileged AI jobs do not process closed or fork PRs');
+                return;
+              }
+            }
+            core.setOutput('allowed', 'true');
+
   claude-code-action:
-    if: |
-      (github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||
-      (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||
-      (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||
-      (github.event_name == 'issues' && contains(github.event.issue.body, '@claude'))
+    needs: authorize
+    if: needs.authorize.outputs.allowed == 'true' && ((github.event_name == 'issue_comment' && contains(github.event.comment.body, '@claude')) ||       (github.event_name == 'pull_request_review_comment' && contains(github.event.comment.body, '@claude')) ||       (github.event_name == 'pull_request_review' && contains(github.event.review.body, '@claude')) ||       (github.event_name == 'issues' && contains(github.event.issue.body, '@claude')))
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -26,6 +64,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Run Claude PR Action
         uses: anthropics/claude-code-action@beta
